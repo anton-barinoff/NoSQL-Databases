@@ -1,0 +1,108 @@
+services:
+  # Конфигурационный сервер
+  config:
+    image: mongo:6.0
+    command: mongod --configsvr --replSet configRS --port 27019 --bind_ip_all
+    ports:
+      - "27019:27019"
+    volumes:
+      - ./data/config:/data/db
+
+  # Шарды
+  shard1:
+    image: mongo:6.0
+    command: mongod --shardsvr --replSet shard1RS --port 27018 --bind_ip_all
+    ports:
+      - "27018:27018"
+    volumes:
+      - ./data/shard1:/data/db
+
+  shard2:
+    image: mongo:6.0
+    command: mongod --shardsvr --replSet shard2RS --port 27018 --bind_ip_all
+    ports:
+      - "27017:27018"
+    volumes:
+      - ./data/shard2:/data/db
+
+  # Роутер
+  mongos:
+    image: mongo:6.0
+    command: mongos --configdb configRS/config:27019 --port 27017 --bind_ip_all
+    ports:
+      - "27000:27017"
+    depends_on:
+      - config
+      - shard1
+      - shard2
+
+  # Инициализатор
+  init:
+    image: mongo:6.0
+    depends_on:
+      - mongos
+    entrypoint: |
+      bash -c "
+        echo 'Initializing config server'
+        mongosh --host config:27019 --eval '
+          rs.initiate({
+            _id: \"configRS\",
+            configsvr: true,
+            members: [{ _id: 0, host: \"config:27019\" }]
+          })
+        '
+        
+        echo 'Initializing shard1'
+        mongosh --host shard1:27018 --eval '
+          rs.initiate({
+            _id: \"shard1RS\",
+            members: [{ _id: 0, host: \"shard1:27018\" }]
+          })
+        '
+        
+        echo 'Initializing shard2'
+        mongosh --host shard2:27018 --eval '
+          rs.initiate({
+            _id: \"shard2RS\",
+            members: [{ _id: 0, host: \"shard2:27018\" }]
+          })
+        '
+        
+        echo 'Adding shards to cluster'
+        mongosh --host mongos:27017 --eval '
+          sh.addShard(\"shard1RS/shard1:27018\");
+          sh.addShard(\"shard2RS/shard2:27018\");
+          sh.status();
+          sh.enableSharding(\"etl_db\");
+        '
+        
+        echo 'CLUSTER LAUNCHED SUCCESSFULLY'
+      "
+
+  # Python скрипт для генерации данных
+  generator:
+    build: ./data-generator
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      - MONGO_URI=mongodb://mongos:27017/
+    volumes:
+      - ./data-generator:/app
+    working_dir: /app
+    command: python generate_mongo_data.py
+
+  # Python приложение
+  app:
+    build: ./python-app
+    depends_on:
+      generator:
+        condition: service_completed_successfully
+    environment:
+      - MONGO_URI=mongodb://mongos:27017/
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./python-app:/app
+    working_dir: /app
+    command: python main.py
